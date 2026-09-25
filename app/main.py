@@ -10,6 +10,7 @@ POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为
 POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读重求最少窑次建议
 POST /plans/{plan_id}/kilns/{index}/temperature-check
                                            窑次温控核验：求落在合格温区内的最长连续时段
+POST /plans/{plan_id}/firing-order        单台实体窑点火排程：全部批次不逾期时最早整体完工
 GET  /health                             健康检查
 """
 
@@ -22,6 +23,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import database
+from .firing import (
+    FiringOrderInfeasibleError,
+    FiringBatchInput,
+    schedule_firing_order,
+)
 from .schemas import (
     AppendItemsIn,
     CancelItemsIn,
@@ -29,6 +35,9 @@ from .schemas import (
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
+    FiringOrderIn,
+    FiringOrderOut,
+    FiringSlotOut,
     GlazeSeparationIn,
     GlazeSeparationOut,
     KilnOut,
@@ -80,6 +89,16 @@ def _target_unreachable_handler(_: Request, exc: TargetUnreachableError) -> JSON
     return JSONResponse(
         status_code=400,
         content={"error": "TARGET_UNREACHABLE", "message": str(exc)},
+    )
+
+
+@app.exception_handler(FiringOrderInfeasibleError)
+def _firing_order_infeasible_handler(
+    _: Request, exc: FiringOrderInfeasibleError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "FIRING_ORDER_INFEASIBLE", "message": str(exc)},
     )
 
 
@@ -672,4 +691,84 @@ def temperature_check(
         end=format_fraction(result.end),
         duration_seconds=format_fraction(result.duration),
         meets_requirement=result.meets_requirement,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/firing-order",
+    response_model=FiringOrderOut,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "批次未恰好覆盖全部窑次 / 不存在不逾期的点火顺序",
+        },
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="单台实体窑点火排程：全部批次不逾期时最早整体完工",
+)
+def firing_order(plan_id: str, payload: FiringOrderIn) -> FiringOrderOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kilns = sorted(plan["kilns"], key=lambda k: k["index"])
+    expected_indices = [k["index"] for k in kilns]
+    given_indices = sorted(b.kiln_index for b in payload.batches)
+    if given_indices != expected_indices:
+        missing = sorted(set(expected_indices) - set(given_indices))
+        extra = sorted(set(given_indices) - set(expected_indices))
+        problems = []
+        if missing:
+            problems.append(f"缺少窑次序号: {', '.join(map(str, missing))}")
+        if extra:
+            problems.append(
+                f"多出不属于该方案的窑次序号: {', '.join(map(str, extra))}"
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "FIRING_BATCH_MISMATCH",
+                "message": (
+                    f"批次必须恰好覆盖方案的全部 {len(kilns)} 个窑次: "
+                    + "；".join(problems)
+                ),
+            },
+        )
+
+    # 只读计算：以请求给出的各窑次排程窗口求点火顺序，不改写方案的装窑结果。
+    # 无可行顺序时 solver 抛出 FiringOrderInfeasibleError，由全局处理器返回 400。
+    result = schedule_firing_order(
+        [
+            FiringBatchInput(
+                kiln_index=b.kiln_index,
+                release_minute=b.earliest_firing_minute,
+                firing_minutes=b.firing_minutes,
+                deadline_minute=b.latest_finish_minute,
+            )
+            for b in payload.batches
+        ]
+    )
+
+    item_ids_by_index = {k["index"]: list(k["item_ids"]) for k in kilns}
+    return FiringOrderOut(
+        plan_id=plan["id"],
+        batch_count=len(kilns),
+        makespan_minute=result.makespan_minute,
+        slots=[
+            FiringSlotOut(
+                order=slot.order,
+                kiln_index=slot.kiln_index,
+                item_ids=item_ids_by_index[slot.kiln_index],
+                start_minute=slot.start_minute,
+                finish_minute=slot.finish_minute,
+            )
+            for slot in result.slots
+        ],
     )

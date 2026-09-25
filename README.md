@@ -5,8 +5,10 @@
 **最少窑次**方案，并在窑次相同时选择**整体字典序最小**的方案。
 已保存的方案支持目标窑次容量反查、限窑次接单、追加器物（填入原窑或追加窑次，
 另存为新方案）、**取消器物后的紧凑重排**（另存为新方案）、**釉色隔离**
-（提交器物互斥对，只读重求最少窑次建议）、两版方案差异对比，以及
-**窑次温控核验**（按分段线性插值精确求落在该窑合格温区内的最长连续时段）。
+（提交器物互斥对，只读重求最少窑次建议）、两版方案差异对比、
+**窑次温控核验**（按分段线性插值精确求落在该窑合格温区内的最长连续时段），
+以及**单台实体窑点火排程**（按各窑次的最早可点火 / 烧成时长 / 最迟完成，
+求全部批次均不逾期时的最早整体完工时刻与点火顺序）。
 
 技术栈：Python 3.12 · FastAPI · SQLite · Uvicorn。
 
@@ -595,6 +597,98 @@ t=35～50 降温于 `85/2` 秒（42.5 秒）回到 220，与其后仍在温区�
 - `422`：采样或参数非法（采样为空 / 时刻非严格递增 / 非整数 /
   保温秒数或采样间隔非正整数 / 缺少字段等）。
 
+### 10. 单台实体窑点火排程（全部批次不逾期时最早整体完工）
+
+`POST http://localhost:8000/plans/{id}/firing-order`
+
+方案的各个窑次需要在**同一台实体窑**上逐批烧成：实体窑同一时刻至多烧一批
+（**不可并行**），两批之间**允许空闲**等待。针对**已保存**的方案，按其
+**现有窑次序号**为每一批提交三个分钟数（均为整数，从**同一排程起点 0**
+起算）：
+
+- `earliest_firing_minute`：该批**最早可点火**分钟（非负整数）；
+- `firing_minutes`：该批**烧成时长**（正整数分钟，点火后连续占用实体窑）；
+- `latest_finish_minute`：该批**最迟完成**分钟（非负整数，完成时刻不得晚于它）。
+
+请求中的批次必须**恰好覆盖方案的全部窑次**（不缺、不多、窑次序号不重复）。
+服务求一个点火顺序，使**全部批次均不逾期**（完成时刻 ≤ 各自最迟完成分钟），
+并令**整体完工时刻（最后一批完成时刻）最早**；返回各批次的点火 / 完成时刻
+与点火顺序。**只读计算，不改写方案的装窑结果。**
+
+请求体（沿用第 1 节容量 10 的 3 窑方案 `[p1] [p2,p3] [p4]`）：
+
+```json
+{
+  "batches": [
+    {"kiln_index": 1, "earliest_firing_minute": 0,  "firing_minutes": 10, "latest_finish_minute": 100},
+    {"kiln_index": 2, "earliest_firing_minute": 0,  "firing_minutes": 8,  "latest_finish_minute": 100},
+    {"kiln_index": 3, "earliest_firing_minute": 0,  "firing_minutes": 5,  "latest_finish_minute": 100}
+  ]
+}
+```
+
+字段约束：`batches` 数量 1～14；`kiln_index` 为 ≥ 1 的整数（与方案中窑次序号
+一致）且请求内不重复；最早可点火 / 最迟完成为**非负整数**，烧成时长为
+**正整数**；批次集合必须与方案的全部窑次**一一对应**。
+
+curl 示例：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/firing-order \
+  -H 'Content-Type: application/json' \
+  -d '{"batches": [{"kiln_index": 1, "earliest_firing_minute": 0, "firing_minutes": 10, "latest_finish_minute": 100}, {"kiln_index": 2, "earliest_firing_minute": 0, "firing_minutes": 8, "latest_finish_minute": 100}, {"kiln_index": 3, "earliest_firing_minute": 0, "firing_minutes": 5, "latest_finish_minute": 100}]}'
+```
+
+成功响应 `200 OK`。上例三批均可从起点点火、窗口宽松，故按窑次序号紧排
+`1 → 2 → 3`（无空闲），整体完工 23 分钟：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "batch_count": 3,
+  "makespan_minute": 23,
+  "slots": [
+    {"order": 1, "kiln_index": 1, "item_ids": ["p1"],       "start_minute": 0,  "finish_minute": 10},
+    {"order": 2, "kiln_index": 2, "item_ids": ["p2", "p3"], "start_minute": 10, "finish_minute": 18},
+    {"order": 3, "kiln_index": 3, "item_ids": ["p4"],       "start_minute": 18, "finish_minute": 23}
+  ]
+}
+```
+
+`slots` 按点火顺序 `order`（从 1 开始）排列，**恰好覆盖全部窑次**；
+`start_minute = max(上一批完成时刻, 本批最早可点火分钟)`（实体窑可空闲等待），
+`finish_minute = start_minute + firing_minutes`；`makespan_minute` 取最后一批
+完成时刻，是所有不逾期顺序中的**最小值**。最早完工顺序并列时，返回其中
+**窑次序号序列字典序最小**的点火顺序（完全对称的批次即按 `1,2,3,…` 紧排）。
+
+最早可点火 / 最迟完成会改变最优顺序：把窑 1 的最早可点火改为第 20 分钟、
+窑 3 的最迟完成收紧到第 12 分钟时，最优顺序变为
+`3（0→5）→ 2（5→13）→ 1（20→30，空闲等待）`，整体完工 30 分钟：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "batch_count": 3,
+  "makespan_minute": 30,
+  "slots": [
+    {"order": 1, "kiln_index": 3, "item_ids": ["p4"],       "start_minute": 0,  "finish_minute": 5},
+    {"order": 2, "kiln_index": 2, "item_ids": ["p2", "p3"], "start_minute": 5,  "finish_minute": 13},
+    {"order": 3, "kiln_index": 1, "item_ids": ["p1"],       "start_minute": 20, "finish_minute": 30}
+  ]
+}
+```
+
+错误情况：
+
+- `400` `FIRING_BATCH_MISMATCH`：批次未恰好覆盖方案全部窑次（缺窑次或出现
+  不属于该方案的窑次序号），响应体列出缺少 / 多出的序号；
+- `400` `FIRING_ORDER_INFEASIBLE`：**不存在**使全部批次均不逾期的点火顺序
+  （例如各批烧成总时长超过最迟完成窗口，或释放 / 截止窗口相互冲突；
+  某批 `最早可点火 + 烧成时长 > 最迟完成` 时该批自身即无法烧成）；
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `422`：请求参数非法（批次为空 / 超过 14 个 / 窑次序号重复 /
+  最早可点火或最迟完成为负数 / 烧成时长非正整数 / 缺少字段等）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -603,11 +697,12 @@ pip install -r requirements.txt
 KILN_DB_PATH=./kiln.db uvicorn app.main:app --reload
 ```
 
-运行求解器与温控核验测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
+运行求解器、温控核验与点火排程测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
 
 ```bash
 python3 tests/test_solver.py
 python3 tests/test_tempcheck.py
+python3 tests/test_firing.py
 ```
 
 ## 算法说明（n ≤ 14）
@@ -683,18 +778,39 @@ n = 14 时与求解器同为万级枚举规模，典型耗时约 1～3 秒。
 相邻段在采样点处端点相接即合并为同一连续时段。取时长最长者（等长取开始
 最早），无正时长时段时起止为空、时长为 0。计算量为采样点数的线性级。
 
+`firing-order` 接口的单台实体窑点火排程：这是单机、批次不可并行、允许空闲、
+带**最早可点火（释放时刻）与最迟完成（截止时刻）**的排程问题
+（`1|r_j|L_max ≤ 0` 可行性 + 最早 `C_max`，一般情形 NP 难），窑次数至多 14，
+用位掩码 DP 精确求解。
+
+1. 前向位掩码 DP 求每个批次集合从起点 0 起排的**最早完工时刻**：
+   `dp[0]=0`，`dp[mask] = min_j max(dp[mask∖{j}], r_j) + p_j`
+   （仅保留完成时刻 `≤ d_j` 的转移）；`dp[全集]` 为 +∞ 即无任何不逾期顺序，
+   否则它就是**最早整体完工时刻 C\***。
+2. 逐批贪心重建：已选前缀结束后实体窑于 `t` 空闲，按窑次序号升序尝试把批次
+   `j` 作为下一批（`s = max(t, r_j)`，完成 `c = s + p_j ≤ d_j`），并用同构的
+   **后缀可行性 DP**（初值由 0 换为 `c`）判断其余批次从 `c` 起排能否恰在
+   C\* 完工；首个可扩展为最优顺序的候选即被选中。每一步都存在可扩展候选
+   （最优顺序本身按位提供），故重建必不中断，且序号升序取首个可扩展候选
+   恰好得到全部最早完工顺序中**窑次序号序列字典序最小**者。
+
+分钟数全为整数、运算仅含 `max` 与加法，各批点火 / 完成时刻亦为整数。
+n = 14 时典型耗时在数秒以内。
+
 ## 目录结构
 
 ```
 app/
   solver.py     # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
   tempcheck.py  # 窑温核验：分段线性 + 分数精确求最长合格时段（纯函数）
+  firing.py     # 单台实体窑点火排程：释放/截止窗口位掩码 DP（纯函数）
   database.py   # SQLite 初始化与读写
   schemas.py    # Pydantic 请求/响应模型
   main.py       # FastAPI 路由
 tests/
   test_solver.py
   test_tempcheck.py
+  test_firing.py
 entrypoint.sh   # 安装依赖 → 初始化数据库 → 启动服务
 Dockerfile
 docker-compose.yml

@@ -344,3 +344,75 @@ class CancelItemsOut(BaseModel):
         ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
     )
     new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")
+
+
+class FiringBatchIn(BaseModel):
+    """单批（方案的一个窑次）的点火排程参数，分钟均从同一排程起点起算。"""
+
+    kiln_index: int = Field(
+        ..., strict=True, ge=1, description="窑次序号（从 1 开始，与方案中窑次序号一致）"
+    )
+    earliest_firing_minute: int = Field(
+        ..., strict=True, ge=0, description="最早可点火分钟（非负整数）"
+    )
+    firing_minutes: int = Field(
+        ..., strict=True, ge=1, description="烧成时长（正整数分钟）"
+    )
+    latest_finish_minute: int = Field(
+        ..., strict=True, ge=0, description="最迟完成分钟（非负整数）"
+    )
+
+
+class FiringOrderIn(BaseModel):
+    """单台实体窑点火排程请求：批次必须恰好覆盖方案的全部窑次。"""
+
+    batches: list[FiringBatchIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="各窑次批次（1～14 个），窑次序号在请求内不重复，"
+        "且必须恰好覆盖方案的全部窑次（不缺、不多）",
+    )
+
+    @model_validator(mode="after")
+    def _unique_kiln_indices(self):
+        seen: set[int] = set()
+        dup: list[int] = []
+        for b in self.batches:
+            if b.kiln_index in seen and b.kiln_index not in dup:
+                dup.append(b.kiln_index)
+            seen.add(b.kiln_index)
+        if dup:
+            dup.sort()
+            raise ValueError(
+                f"窑次序号不得重复，重复序号: {', '.join(map(str, dup))}"
+            )
+        return self
+
+
+class FiringSlotOut(BaseModel):
+    """点火顺序中的一个位置。"""
+
+    order: int = Field(..., description="点火顺序位置（从 1 开始）")
+    kiln_index: int = Field(..., description="窑次序号（与方案中窑次序号一致）")
+    item_ids: list[str] = Field(..., description="该窑器物编号，按编号升序")
+    start_minute: int = Field(
+        ..., description="点火时刻（分钟，从排程起点起算）"
+    )
+    finish_minute: int = Field(
+        ..., description="完成时刻（分钟，从排程起点起算）"
+    )
+
+
+class FiringOrderOut(BaseModel):
+    """单台实体窑点火排程结果（只读计算，不改写原方案装窑结果）。"""
+
+    plan_id: str = Field(..., description="方案 ID")
+    batch_count: int = Field(..., description="批次数（= 方案窑次数）")
+    makespan_minute: int = Field(
+        ..., description="全部批次均不逾期时的最早整体完工时刻（分钟）"
+    )
+    slots: list[FiringSlotOut] = Field(
+        ...,
+        description="各批次点火 / 完成时刻，按点火顺序 order 升序，恰好覆盖全部窑次",
+    )
