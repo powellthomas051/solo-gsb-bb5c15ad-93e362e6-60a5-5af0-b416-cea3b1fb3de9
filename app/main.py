@@ -10,6 +10,7 @@ POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为
 POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读重求最少窑次建议
 POST /plans/{plan_id}/kilns/{index}/temperature-check
                                            窑次温控核验：求落在合格温区内的最长连续时段
+POST /plans/{plan_id}/firing-order       单台实体窑点火排程：全部批次不逾期的最早整体完工
 GET  /health                             健康检查
 """
 
@@ -22,6 +23,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import database
+from .firing import (
+    FiringBatch,
+    NoFeasibleFiringOrderError,
+    earliest_firing_schedule,
+)
 from .schemas import (
     AppendItemsIn,
     CancelItemsIn,
@@ -29,6 +35,9 @@ from .schemas import (
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
+    FiringBatchOut,
+    FiringOrderIn,
+    FiringOrderOut,
     GlazeSeparationIn,
     GlazeSeparationOut,
     KilnOut,
@@ -80,6 +89,16 @@ def _target_unreachable_handler(_: Request, exc: TargetUnreachableError) -> JSON
     return JSONResponse(
         status_code=400,
         content={"error": "TARGET_UNREACHABLE", "message": str(exc)},
+    )
+
+
+@app.exception_handler(NoFeasibleFiringOrderError)
+def _no_feasible_firing_order_handler(
+    _: Request, exc: NoFeasibleFiringOrderError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "NO_FEASIBLE_FIRING_ORDER", "message": str(exc)},
     )
 
 
@@ -672,4 +691,100 @@ def temperature_check(
         end=format_fraction(result.end),
         duration_seconds=format_fraction(result.duration),
         meets_requirement=result.meets_requirement,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/firing-order",
+    response_model=FiringOrderOut,
+    tags=["plans"],
+    responses={
+        400: {"model": ErrorOut, "description": "窑次未恰好覆盖 / 无可行点火顺序"},
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="单台实体窑点火排程：全部批次不逾期的最早整体完工",
+)
+def firing_order(plan_id: str, payload: FiringOrderIn) -> FiringOrderOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kiln_count = plan["kiln_count"]
+    unknown = sorted(
+        {
+            b.kiln_index
+            for b in payload.batches
+            if not 1 <= b.kiln_index <= kiln_count
+        }
+    )
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_KILN_INDEX",
+                "message": (
+                    f"方案 {plan_id} 共 {kiln_count} 个窑次，窑次序号须为 "
+                    f"1～{kiln_count}: {', '.join(str(i) for i in unknown)}"
+                ),
+            },
+        )
+    covered = {b.kiln_index for b in payload.batches}
+    missing = sorted(set(range(1, kiln_count + 1)) - covered)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_KILN_BATCH",
+                "message": (
+                    f"必须恰好覆盖全部 {kiln_count} 个窑次，缺少窑次: "
+                    + ", ".join(str(i) for i in missing)
+                ),
+            },
+        )
+
+    # 只读计算：以方案保存的窑次明细带出各批器物编号，不改写原方案。
+    # 无可行顺序时 firing 模块抛出 NoFeasibleFiringOrderError，
+    # 由全局处理器返回 400。
+    items_by_index = {k["index"]: k["item_ids"] for k in plan["kilns"]}
+    constraint_by_index = {b.kiln_index: b for b in payload.batches}
+    schedule = earliest_firing_schedule(
+        [
+            FiringBatch(
+                kiln_index=b.kiln_index,
+                earliest_start=b.earliest_start_minute,
+                duration=b.duration_minutes,
+                latest_completion=b.latest_completion_minute,
+            )
+            for b in payload.batches
+        ]
+    )
+
+    batches_out: list[FiringBatchOut] = []
+    for pos, b in enumerate(schedule.batches, start=1):
+        c = constraint_by_index[b.kiln_index]
+        batches_out.append(
+            FiringBatchOut(
+                position=pos,
+                kiln_index=b.kiln_index,
+                item_ids=list(items_by_index[b.kiln_index]),
+                earliest_start_minute=c.earliest_start_minute,
+                duration_minutes=c.duration_minutes,
+                latest_completion_minute=c.latest_completion_minute,
+                start_minute=b.start,
+                completion_minute=b.completion,
+            )
+        )
+
+    return FiringOrderOut(
+        plan_id=plan["id"],
+        kiln_count=kiln_count,
+        makespan_minute=schedule.makespan,
+        order=[b.kiln_index for b in schedule.batches],
+        batches=batches_out,
     )

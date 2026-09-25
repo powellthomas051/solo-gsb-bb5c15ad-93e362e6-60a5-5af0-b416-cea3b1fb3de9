@@ -323,6 +323,78 @@ class TemperatureCheckOut(BaseModel):
     )
 
 
+class FiringBatchIn(BaseModel):
+    """一批（一个窑次）的点火约束；分钟均从同一排程起点计算。"""
+
+    kiln_index: int = Field(
+        ..., strict=True, ge=1, description="窑次序号（与方案中一致，从 1 开始）"
+    )
+    earliest_start_minute: int = Field(
+        ..., strict=True, ge=0, description="最早可点火分钟（非负整数）"
+    )
+    duration_minutes: int = Field(
+        ..., strict=True, ge=1, description="烧成时长（分钟，正整数）"
+    )
+    latest_completion_minute: int = Field(
+        ..., strict=True, ge=0, description="最迟完成分钟（非负整数）"
+    )
+
+
+class FiringOrderIn(BaseModel):
+    """单台实体窑点火排程请求：必须恰好覆盖方案全部窑次。"""
+
+    batches: list[FiringBatchIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="每批的点火约束：必须恰好覆盖方案全部窑次，每个窑次恰好一条",
+    )
+
+    @model_validator(mode="after")
+    def _unique_kiln_index(self):
+        seen: set[int] = set()
+        dup: list[int] = []
+        for b in self.batches:
+            if b.kiln_index in seen and b.kiln_index not in dup:
+                dup.append(b.kiln_index)
+            seen.add(b.kiln_index)
+        if dup:
+            raise ValueError(
+                "窑次序号不得重复，重复序号: "
+                + ", ".join(str(i) for i in dup)
+            )
+        return self
+
+
+class FiringBatchOut(BaseModel):
+    """一批的点火安排（按点火顺序返回）。"""
+
+    position: int = Field(..., description="点火顺序位次，从 1 开始")
+    kiln_index: int = Field(..., description="窑次序号（与方案中一致）")
+    item_ids: list[str] = Field(..., description="该窑器物编号，按编号升序")
+    earliest_start_minute: int = Field(..., description="请求的最早可点火分钟")
+    duration_minutes: int = Field(..., description="请求的烧成时长（分钟）")
+    latest_completion_minute: int = Field(..., description="请求的最迟完成分钟")
+    start_minute: int = Field(..., description="点火分钟（从排程起点计算）")
+    completion_minute: int = Field(
+        ..., description="完成分钟（从排程起点计算，不晚于最迟完成分钟）"
+    )
+
+
+class FiringOrderOut(BaseModel):
+    """单台实体窑点火排程结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="方案 ID")
+    kiln_count: int = Field(..., description="批次数（方案窑次数）")
+    makespan_minute: int = Field(
+        ..., description="最早整体完工时刻（分钟，从排程起点计算）"
+    )
+    order: list[int] = Field(..., description="点火顺序：窑次序号按点火先后排列")
+    batches: list[FiringBatchOut] = Field(
+        ..., description="各批点火安排，按点火顺序"
+    )
+
+
 class CancelItemsOut(BaseModel):
     """取消器物并重排的结果（另存为新方案，不改写原方案）。"""
 
